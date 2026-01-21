@@ -229,6 +229,12 @@ def _index_html() -> str:
         const m = text.match(/Normalized order id:\\s*'([^']+)'/);
         if (m) orderEls.order_id.textContent = m[1];
 
+        // If the email server persists shipping, reflect that in UI immediately.
+        // Note: FastAPI streams stderr lines too; email_server uses logging with prefix.
+        if (/Updated order status\\s*->\\s*shipped/i.test(text)) {
+          setBadge('shipped');
+        }
+
         // Extract tool_result JSON from: [host] tool_result -> {...}
         const t = text.match(/\\[host\\]\\s+tool_result\\s+->\\s+(\\{.*\\})\\s*$/);
         if (!t) return;
@@ -268,6 +274,33 @@ def _index_html() -> str:
         assistantSaysEl.textContent = text;
       }
 
+      function extractOrderIdFromCommand(cmd) {
+        // Accept: "ship ABC-123", "ship order ABC-123", "Ship order ORD-1001".
+        const m = (cmd || '').match(/\\bship\\b(?:\\s+order)?\\s+([A-Za-z0-9-]+)/i);
+        return m ? m[1] : null;
+      }
+
+      async function refreshOrderById(orderId) {
+        if (!orderId) return;
+        try {
+          const resp = await fetch(`/api/order/${encodeURIComponent(orderId)}`);
+          if (!resp.ok) return;
+          const obj = await resp.json();
+          if (obj && typeof obj === 'object') {
+            if (obj.order_id) orderEls.order_id.textContent = obj.order_id;
+            if (obj.customer_email) orderEls.customer_email.textContent = obj.customer_email;
+            if (obj.customer_name) orderEls.customer_name.textContent = obj.customer_name;
+            if (obj.product) orderEls.product.textContent = obj.product;
+            if (obj.price != null) orderEls.price.textContent = String(obj.price);
+            if (obj.shipping_address) orderEls.shipping_address.textContent = obj.shipping_address;
+            if (obj.notes != null) orderEls.notes.textContent = obj.notes;
+            if (obj.status) setBadge(obj.status);
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+
       async function startRun() {
         const cmd = (cmdEl.value || '').trim();
         if (!cmd) return;
@@ -298,9 +331,20 @@ def _index_html() -> str:
           tryParseOrderFromLine(msg.text);
           tryParseAssistantSentence(msg.stream, msg.text);
         });
-        es.addEventListener('done', (evt) => {
+        es.addEventListener('done', async (evt) => {
           const msg = JSON.parse(evt.data);
           addDebug('stdout', `DONE (exit_code=${msg.exit_code})`);
+
+          // After the agent finishes, re-fetch the order snapshot from the DB and
+          // update the Order Summary with the latest status.
+          if (msg.exit_code === 0) {
+            const orderId = orderEls.order_id.textContent !== '—'
+              ? orderEls.order_id.textContent
+              : extractOrderIdFromCommand(cmd);
+
+            await refreshOrderById(orderId);
+          }
+
           statusEl.textContent = 'Ready.';
           cleanup();
         });
@@ -345,6 +389,37 @@ async def index() -> str:
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/order/{order_id}")
+async def api_get_order(order_id: str) -> JSONResponse:
+    """Fetch the latest order snapshot from data.json.
+
+    Used by the UI to refresh state after a ship/process run.
+    """
+
+    try:
+        import json as _json
+
+        db_path = os.path.join(PROJECT_DIR, "data.json")
+        with open(db_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+
+        orders = data.get("orders", {})
+        if not isinstance(orders, dict):
+            return JSONResponse({"detail": "invalid db shape"}, status_code=500)
+
+        normalized_id = str(order_id or "").strip().lstrip("#").strip()
+        order = orders.get(normalized_id)
+        if order is None:
+            return JSONResponse({"detail": "order not found"}, status_code=404)
+
+        payload = dict(order) if isinstance(order, dict) else {"order": order}
+        payload.setdefault("order_id", normalized_id)
+        return JSONResponse(payload)
+
+    except Exception as e:
+        return JSONResponse({"detail": f"{type(e).__name__}: {e}"}, status_code=500)
 
 
 @app.post("/run")
