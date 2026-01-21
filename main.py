@@ -1,0 +1,318 @@
+"""Autonomous Operations Agent (Host)
+
+This Host process is an MCP client that connects to two MCP servers using the
+standard stdio "wall socket" pattern:
+- CRM server (tools like `get_customer_email`)
+- Email server (tools like `send_shipping_confirmation`)
+
+The Host itself contains no hardcoded "API logic" for those services; it only:
+1) connects to MCP servers,
+2) exposes their tools to the model,
+3) executes whichever tool calls the model requests.
+
+Usage:
+  set OPENAI_API_KEY=... (Windows cmd.exe)
+  python main.py "Process new order #XYZ-789"
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import sys
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from openai import AsyncOpenAI
+
+from mcp import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+
+
+ORDER_ID_RE = re.compile(r"#([A-Za-z0-9-]+)")
+
+
+@dataclass(frozen=True)
+class WallSocket:
+    """A swappable MCP server connection descriptor."""
+
+    name: str
+    command: str
+    args: List[str]
+
+
+def _extract_order_id(user_text: str) -> str:
+    match = ORDER_ID_RE.search(user_text)
+    if not match:
+        raise ValueError("Could not find order id in input. Expected something like '... #XYZ-789'.")
+    return match.group(1)
+
+
+async def _connect_wall_socket(ws: WallSocket) -> ClientSession:
+    """Create an MCP client session to an MCP server via stdio."""
+
+    params = StdioServerParameters(command=ws.command, args=ws.args)
+    stdio = stdio_client(params)
+    reader, writer = await stdio.__aenter__()
+    session = ClientSession(reader, writer)
+    await session.__aenter__()
+    await session.initialize()
+
+    # Store stdio context manager so we can close it later.
+    setattr(session, "_wall_socket_stdio", stdio)
+    return session
+
+
+async def _close_wall_socket(session: ClientSession) -> None:
+    """Gracefully close the MCP session and its underlying stdio transport."""
+
+    stdio = getattr(session, "_wall_socket_stdio", None)
+    try:
+        await session.__aexit__(None, None, None)
+    finally:
+        if stdio is not None:
+            await stdio.__aexit__(None, None, None)
+
+
+def _tool_specs_from_mcp(tools: Any) -> List[Dict[str, Any]]:
+    """Convert MCP tool definitions into OpenAI tool specs."""
+
+    tool_specs: List[Dict[str, Any]] = []
+    for t in getattr(tools, "tools", tools):
+        # FastMCP returns an object with fields similar to:
+        # - name
+        # - description
+        # - inputSchema (JSON Schema)
+        tool_specs.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description or "",
+                    "parameters": t.inputSchema,
+                },
+            }
+        )
+    return tool_specs
+
+
+async def _dispatch_tool_call(
+    *,
+    sessions_by_tool: Dict[str, ClientSession],
+    tool_name: str,
+    arguments: Dict[str, Any],
+) -> str:
+    session = sessions_by_tool.get(tool_name)
+    if session is None:
+        raise RuntimeError(f"No MCP server session registered for tool '{tool_name}'.")
+
+    result = await session.call_tool(tool_name, arguments)
+
+    # MCP call_tool returns a result with 'content' that may be a list of content parts.
+    content = getattr(result, "content", result)
+    if isinstance(content, list):
+        # Prefer textual parts; fallback to repr.
+        texts: List[str] = []
+        for part in content:
+            text = getattr(part, "text", None)
+            if text is not None:
+                texts.append(text)
+        return "\n".join(texts) if texts else repr(content)
+
+    return str(content)
+
+
+async def run_agent(user_input: str) -> None:
+    order_id = _extract_order_id(user_input)
+
+    # "Wall sockets": swap implementations by changing only these descriptors.
+    crm_ws = WallSocket(name="crm", command=sys.executable, args=["crm_server.py"])
+    email_ws = WallSocket(name="email", command=sys.executable, args=["email_server.py"])
+
+    crm_session: Optional[ClientSession] = None
+    email_session: Optional[ClientSession] = None
+
+    try:
+        crm_session = await _connect_wall_socket(crm_ws)
+        email_session = await _connect_wall_socket(email_ws)
+
+        crm_tools = await crm_session.list_tools()
+        email_tools = await email_session.list_tools()
+
+        # Build a routing table by tool name to its owning server session.
+        sessions_by_tool: Dict[str, ClientSession] = {}
+        for t in getattr(crm_tools, "tools", crm_tools):
+            sessions_by_tool[t.name] = crm_session
+        for t in getattr(email_tools, "tools", email_tools):
+            sessions_by_tool[t.name] = email_session
+
+        tool_specs = _tool_specs_from_mcp(crm_tools) + _tool_specs_from_mcp(email_tools)
+
+        # Accept either OPENAI_API_KEY (preferred) or OPENAI_KEY (common mistake).
+        # Strip whitespace because Windows `set VAR=value   ` may include trailing spaces.
+        api_key = (os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY") or "").strip()
+        if not api_key:
+            raise RuntimeError(
+                "OPENAI_API_KEY is not set. "
+                "Set it in your environment before running, e.g.\n"
+                "  set OPENAI_API_KEY=YOUR_KEY\n"
+                "If you used a .env file, ensure the variable name is OPENAI_API_KEY (not OPENAI_KEY)."
+            )
+
+        # Support OpenAI-compatible providers via OPENAI_BASE_URL.
+        # Example: OPENAI_BASE_URL=https://your-gateway.example/api
+        base_url = (os.environ.get("OPENAI_BASE_URL") or "").strip() or None
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+        system_prompt = (
+            "You are an Autonomous Operations Agent. "
+            "Given an instruction to process a new order, you must: "
+            "(1) call get_customer_email(order_id) to retrieve the email; "
+            "(2) then call send_shipping_confirmation(email, order_details) to send a confirmation; "
+            "(3) then stop calling tools and reply with a short confirmation message. "
+            "Do not call any other tools unless strictly necessary."
+        )
+
+        # Seed the model with the order id and the user instruction.
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"Instruction: {user_input}\nOrder id: {order_id}",
+            },
+        ]
+
+        # Tool-calling loop.
+        for _ in range(8):
+            model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+
+            # Some OpenAI-compatible gateways do not implement the Responses API.
+            # If OPENAI_BASE_URL is set, prefer the Chat Completions API.
+            if base_url:
+                resp = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=tool_specs,
+                )
+            else:
+                resp = await client.responses.create(
+                    model=model,
+                    input=messages,
+                    tools=tool_specs,
+                )
+
+            # Normalize tool calls across Responses API vs Chat Completions.
+            if base_url:
+                # Chat Completions response shape.
+                choice = resp.choices[0]
+                msg = choice.message
+
+                tool_calls = getattr(msg, "tool_calls", None) or []
+                if not tool_calls:
+                    print(getattr(msg, "content", "") or "")
+                    return
+
+                for call in tool_calls:
+                    tool_name = call.function.name
+                    import json
+
+                    args = json.loads(call.function.arguments or "{}")
+
+                    tool_output = await _dispatch_tool_call(
+                        sessions_by_tool=sessions_by_tool,
+                        tool_name=tool_name,
+                        arguments=args,
+                    )
+
+                    # If we just sent the shipping confirmation, stop tool looping
+                    # and return a final user-facing message.
+                    if tool_name == "send_shipping_confirmation":
+                        print(f"Processed order #{order_id}. Shipping confirmation sent to {args.get('email')!s}.")
+                        return
+
+                    # Feed tool output back to the model.
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "name": tool_name,
+                            "content": tool_output,
+                        }
+                    )
+
+                continue
+
+            # Responses API response shape.
+            output_items = getattr(resp, "output", [])
+
+            # Collect any tool calls to execute.
+            tool_calls = []
+            for item in output_items:
+                if getattr(item, "type", None) in ("function_call", "tool_call"):
+                    tool_calls.append(item)
+
+            if not tool_calls:
+                # Print final answer text.
+                final_text = getattr(resp, "output_text", None)
+                if final_text:
+                    print(final_text)
+                else:
+                    # Fallback: print any message content we can find.
+                    print(str(resp))
+                return
+
+            # Execute tool calls and append tool outputs.
+            for call in tool_calls:
+                tool_name = getattr(call, "name", None) or getattr(getattr(call, "function", None), "name", None)
+                raw_args = getattr(call, "arguments", None) or getattr(getattr(call, "function", None), "arguments", None)
+                if tool_name is None or raw_args is None:
+                    raise RuntimeError(f"Unrecognized tool call shape: {call!r}")
+
+                # The Responses API returns JSON arguments as a string.
+                if isinstance(raw_args, str):
+                    import json
+
+                    args = json.loads(raw_args) if raw_args else {}
+                else:
+                    args = dict(raw_args)
+
+                tool_output = await _dispatch_tool_call(
+                    sessions_by_tool=sessions_by_tool,
+                    tool_name=tool_name,
+                    arguments=args,
+                )
+
+                # If we just sent the shipping confirmation, stop tool looping
+                # and return a final user-facing message.
+                if tool_name == "send_shipping_confirmation":
+                    print(f"Processed order #{order_id}. Shipping confirmation sent to {args.get('email')!s}.")
+                    return
+
+                # Provide the tool result back to the model.
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": getattr(call, "call_id", None) or getattr(call, "id", None),
+                        "name": tool_name,
+                        "content": tool_output,
+                    }
+                )
+
+        raise RuntimeError("Tool loop exceeded max iterations.")
+
+    finally:
+        if email_session is not None:
+            await _close_wall_socket(email_session)
+        if crm_session is not None:
+            await _close_wall_socket(crm_session)
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        raise SystemExit('Usage: python main.py "Process new order #XYZ-789"')
+    asyncio.run(run_agent(" ".join(sys.argv[1:])))
+
+
+if __name__ == "__main__":
+    main()
