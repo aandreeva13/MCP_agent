@@ -1,0 +1,76 @@
+{
+  "orders": {
+    "ORD-1001": {
+      "customer_name": "Иван Иванов",
+      "customer_email": "ivan.ivanov@example.com",
+      "product": "MacBook Pro M3 14\"",
+      "price": 3499.0,
+      "status": "shipped",
+      "shipping_address": "бул. Витоша 15, София",
+      "notes": "Моля, звъннете преди доставка. Входът е откъм двора."
+    },
+    "ORD-1002": {
+      "customer_name": "Мария Петрова",
+      "customer_email": "maria.p@example.com",
+      "product": "Samsung Galaxy S24 Ultra",
+      "price": 2199.0,
+      "status": "shipped",
+      "shipping_address": "ул. Иван Вазов 3, Пловдив",
+      "notes": ""
+    },
+    "ORD-1003": {
+      "customer_name": "Георги Димитров",
+      "customer_email": "g.dimitrov@tech-start.bg",
+      "product": "Dell UltraSharp 27 Monitor (x5)",
+      "price": 4500.0,
+      "status": "processing",
+      "shipping_address": "Бизнес Парк София, сграда 4",
+      "notes": "Корпоративна поръчка. Изисква се фактура."
+    },
+    "ORD-1004": {
+      "customer_name": "Елена Тодорова",
+      "customer_email": "elena.t@gmail.com",
+      "product": "Sony WH-1000XM5 Слушалки",
+      "price": 649.0,
+      "status": "delivered",
+      "shipping_address": "ж.к. Младост 4, бл. 401, София",
+      "notes": "Оставено при портиера на 20.01."
+    },
+    "ORD-2005": {
+      "customer_name": "Стефан Николов",
+      "customer_email": "stefan.nikolov@abv.bg",
+      "product": "Logitech MX Master 3S",
+      "price": 220.0,
+      "status": "cancelled",
+      "shipping_address": "ул. Александровска 12, Варна",
+      "notes": "Клиентът отказа поръчката поради забавяне."
+    },
+    "ORD-2006": {
+      "customer_name": "Анна Колева",
+      "customer_email": "anna.k@example.com",
+      "product": "iPad Air 5",
+      "price": 1350.0,
+      "status": "pending",
+      "shipping_address": "ул. Търговска 5, Бургас",
+      "notes": "Подарък за рожден ден! Моля да се опакова."
+    },
+    "ORD-3007": {
+      "customer_name": "Борис Михайлов",
+      "customer_email": "boris.m@dev.io",
+      "product": "NVIDIA RTX 4090",
+      "price": 3899.0,
+      "status": "shipped",
+      "shipping_address": "ж.к. Люлин 10, София",
+      "notes": "Експресна доставка (платена)."
+    },
+    "ABC-123": {
+      "customer_name": "Тестов Потребител",
+      "customer_email": "test@example.com",
+      "product": "iPhone 15 Case",
+      "price": 49.0,
+      "status": "pending",
+      "shipping_address": "ул. Тестова 1, София",
+      "notes": ""
+    }
+  }
+}

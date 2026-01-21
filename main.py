@@ -19,18 +19,55 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from openai import AsyncOpenAI
 
+
+def _load_dotenv_if_present() -> None:
+    """Best-effort .env loader (no external deps).
+
+    Loads KEY=VALUE pairs into os.environ only if the key is not already set.
+    This keeps explicit environment variables (CI, shell, etc.) as the source of truth.
+
+    Notes:
+      - Supports lines like: KEY=value
+      - Ignores blank lines and comments starting with '#'
+      - Strips surrounding single/double quotes from values
+    """
+
+    env_path = os.path.join(os.getcwd(), ".env")
+    if not os.path.exists(env_path):
+        return
+
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    continue
+
+                # Remove surrounding quotes.
+                if len(value) >= 2 and ((value[0] == value[-1] == '"') or (value[0] == value[-1] == "'")):
+                    value = value[1:-1]
+
+                os.environ.setdefault(key, value)
+    except OSError:
+        # If .env can't be read for any reason, proceed without it.
+        return
+
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
-
-
-ORDER_ID_RE = re.compile(r"#([A-Za-z0-9-]+)")
 
 
 @dataclass(frozen=True)
@@ -42,22 +79,18 @@ class WallSocket:
     args: List[str]
 
 
-def _extract_order_id(user_text: str) -> str:
-    match = ORDER_ID_RE.search(user_text)
-    if not match:
-        raise ValueError("Could not find order id in input. Expected something like '... #XYZ-789'.")
-    return match.group(1)
-
-
 async def _connect_wall_socket(ws: WallSocket) -> ClientSession:
     """Create an MCP client session to an MCP server via stdio."""
 
     params = StdioServerParameters(command=ws.command, args=ws.args)
     stdio = stdio_client(params)
-    reader, writer = await stdio.__aenter__()
+
+    # Give the server time to boot and complete MCP initialize handshake.
+    reader, writer = await asyncio.wait_for(stdio.__aenter__(), timeout=10)
+
     session = ClientSession(reader, writer)
     await session.__aenter__()
-    await session.initialize()
+    await asyncio.wait_for(session.initialize(), timeout=10)
 
     # Store stdio context manager so we can close it later.
     setattr(session, "_wall_socket_stdio", stdio)
@@ -124,11 +157,14 @@ async def _dispatch_tool_call(
 
 
 async def run_agent(user_input: str) -> None:
-    order_id = _extract_order_id(user_input)
+    _load_dotenv_if_present()
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
 
     # "Wall sockets": swap implementations by changing only these descriptors.
-    crm_ws = WallSocket(name="crm", command=sys.executable, args=["crm_server.py"])
-    email_ws = WallSocket(name="email", command=sys.executable, args=["email_server.py"])
+    # Use absolute script paths so the Host can be launched from any working directory.
+    crm_ws = WallSocket(name="crm", command=sys.executable, args=[os.path.join(base_dir, "crm_server.py")])
+    email_ws = WallSocket(name="email", command=sys.executable, args=[os.path.join(base_dir, "email_server.py")])
 
     crm_session: Optional[ClientSession] = None
     email_session: Optional[ClientSession] = None
@@ -166,12 +202,10 @@ async def run_agent(user_input: str) -> None:
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
         system_prompt = (
-            "You are an Autonomous Operations Agent. "
-            "Given an instruction to process a new order, you must: "
-            "(1) call get_customer_email(order_id) to retrieve the email; "
-            "(2) then call send_shipping_confirmation(email, order_details) to send a confirmation; "
-            "(3) then stop calling tools and reply with a short confirmation message. "
-            "Do not call any other tools unless strictly necessary."
+            "You are a helpful Logistics Assistant. "
+            "If the user asks a question about an order (e.g., status, notes, price), answer the question based on the tool result using natural language. "
+            "ONLY call send_email if the user explicitly asks to 'process', 'ship', or 'confirm' the order. "
+            "Never send an email for 'cancelled' orders."
         )
 
         # Seed the model with the order id and the user instruction.
@@ -179,13 +213,13 @@ async def run_agent(user_input: str) -> None:
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
-                "content": f"Instruction: {user_input}\nOrder id: {order_id}",
+                "content": f"Instruction: {user_input}",
             },
         ]
 
         # Tool-calling loop.
         for _ in range(8):
-            model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+            model = os.environ.get("OPENAI_MODEL", "gpt-5.2")
 
             # Some OpenAI-compatible gateways do not implement the Responses API.
             # If OPENAI_BASE_URL is set, prefer the Chat Completions API.
@@ -213,22 +247,43 @@ async def run_agent(user_input: str) -> None:
                     print(getattr(msg, "content", "") or "")
                     return
 
+                # IMPORTANT (LiteLLM / OpenAI-compatible gateways): tool messages must
+                # directly respond to a *preceding* assistant message that contained tool_calls.
+                # So we append the assistant message first, then append each tool result.
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": getattr(msg, "content", None) or "",
+                        "tool_calls": [
+                            {
+                                "id": c.id,
+                                "type": "function",
+                                "function": {"name": c.function.name, "arguments": c.function.arguments},
+                            }
+                            for c in tool_calls
+                        ],
+                    }
+                )
+
                 for call in tool_calls:
                     tool_name = call.function.name
                     import json
 
                     args = json.loads(call.function.arguments or "{}")
 
+                    print(f"[host] tool_call -> id={call.id} name={tool_name}")
+
                     tool_output = await _dispatch_tool_call(
                         sessions_by_tool=sessions_by_tool,
                         tool_name=tool_name,
                         arguments=args,
                     )
+                    print(f"[host] tool_result -> {tool_output}")
 
-                    # If we just sent the shipping confirmation, stop tool looping
+                    # If we just sent an email, stop tool looping
                     # and return a final user-facing message.
-                    if tool_name == "send_shipping_confirmation":
-                        print(f"Processed order #{order_id}. Shipping confirmation sent to {args.get('email')!s}.")
+                    if tool_name.lower().startswith("send"):
+                        print("Processed order. Shipping confirmation sent.")
                         return
 
                     # Feed tool output back to the model.
@@ -282,11 +337,12 @@ async def run_agent(user_input: str) -> None:
                     tool_name=tool_name,
                     arguments=args,
                 )
+                print(f"[host] tool_result -> {tool_output}")
 
-                # If we just sent the shipping confirmation, stop tool looping
+                # If we just sent an email, stop tool looping
                 # and return a final user-facing message.
-                if tool_name == "send_shipping_confirmation":
-                    print(f"Processed order #{order_id}. Shipping confirmation sent to {args.get('email')!s}.")
+                if tool_name.lower().startswith("send"):
+                    print("Processed order. Shipping confirmation sent.")
                     return
 
                 # Provide the tool result back to the model.
@@ -309,6 +365,13 @@ async def run_agent(user_input: str) -> None:
 
 
 def main() -> None:
+    # Ensure Windows console can print Cyrillic/Unicode tool results.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     if len(sys.argv) < 2:
         raise SystemExit('Usage: python main.py "Process new order #XYZ-789"')
     asyncio.run(run_agent(" ".join(sys.argv[1:])))
