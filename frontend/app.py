@@ -11,6 +11,7 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -391,6 +392,15 @@ async def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+class EmailEventIn(BaseModel):
+    # Match common provider webhook shapes but keep it flexible.
+    order_id: str
+    message_id: str
+    event: str  # delivered/opened/clicked/bounced/etc.
+    ts: Optional[int] = None
+    meta: Dict[str, Any] = {}
+
+
 @app.get("/api/order/{order_id}")
 async def api_get_order(order_id: str) -> JSONResponse:
     """Fetch the latest order snapshot from data.json.
@@ -417,6 +427,66 @@ async def api_get_order(order_id: str) -> JSONResponse:
         payload = dict(order) if isinstance(order, dict) else {"order": order}
         payload.setdefault("order_id", normalized_id)
         return JSONResponse(payload)
+
+    except Exception as e:
+        return JSONResponse({"detail": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
+@app.post("/api/email/event")
+async def api_email_event(body: EmailEventIn) -> JSONResponse:
+    """Append an email provider-like event to an order.
+
+    This is a mock webhook receiver to support tracking delivery/open.
+
+    Expected payload example:
+    {
+      "order_id": "ORD-2006",
+      "message_id": "msg_...",
+      "event": "delivered",
+      "ts": 1730000000,
+      "meta": {"provider": "mock"}
+    }
+    """
+
+    try:
+        import json as _json
+        import time as _time
+
+        db_path = os.path.join(PROJECT_DIR, "data.json")
+        with open(db_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+
+        orders = data.get("orders", {})
+        if not isinstance(orders, dict):
+            return JSONResponse({"detail": "invalid db shape"}, status_code=500)
+
+        normalized_id = str(body.order_id or "").strip().lstrip("#").strip()
+        order = orders.get(normalized_id)
+        if order is None or not isinstance(order, dict):
+            return JSONResponse({"detail": "order not found"}, status_code=404)
+
+        events = order.get("email_events")
+        if not isinstance(events, list):
+            events = []
+            order["email_events"] = events
+
+        ts = int(body.ts) if body.ts is not None else int(_time.time())
+        evt = {
+            "event": str(body.event or "").strip(),
+            "message_id": str(body.message_id or "").strip(),
+            "ts": ts,
+            "meta": body.meta or {},
+        }
+        events.append(evt)
+
+        # convenience fields
+        order["email_status"] = evt["event"]
+        order["email_message_id"] = evt["message_id"]
+
+        with open(db_path, "w", encoding="utf-8") as f:
+            _json.dump(data, f, ensure_ascii=False, indent=2)
+
+        return JSONResponse({"ok": True, "order_id": normalized_id, "email_status": order.get("email_status")})
 
     except Exception as e:
         return JSONResponse({"detail": f"{type(e).__name__}: {e}"}, status_code=500)

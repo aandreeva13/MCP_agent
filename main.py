@@ -283,7 +283,21 @@ async def run_agent(user_input: str) -> None:
                     # If we just sent an email, stop tool looping
                     # and return a final user-facing message.
                     if tool_name.lower().startswith("send"):
-                        print("Processed order. Shipping confirmation sent.")
+                        # Provide a clean UI-friendly confirmation.
+                        message_id = None
+                        try:
+                            import json as _json
+
+                            obj = _json.loads(tool_output)
+                            if isinstance(obj, dict):
+                                message_id = obj.get("message_id")
+                        except Exception:
+                            message_id = None
+
+                        if message_id:
+                            print(f"Shipping confirmation sent (message_id={message_id}).")
+                        else:
+                            print("Shipping confirmation sent.")
                         return
 
                     # Feed tool output back to the model.
@@ -342,7 +356,20 @@ async def run_agent(user_input: str) -> None:
                 # If we just sent an email, stop tool looping
                 # and return a final user-facing message.
                 if tool_name.lower().startswith("send"):
-                    print("Processed order. Shipping confirmation sent.")
+                    message_id = None
+                    try:
+                        import json as _json
+
+                        obj = _json.loads(tool_output)
+                        if isinstance(obj, dict):
+                            message_id = obj.get("message_id")
+                    except Exception:
+                        message_id = None
+
+                    if message_id:
+                        print(f"Shipping confirmation sent (message_id={message_id}).")
+                    else:
+                        print("Shipping confirmation sent.")
                     return
 
                 # Provide the tool result back to the model.

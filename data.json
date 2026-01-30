@@ -50,9 +50,27 @@
       "customer_email": "anna.k@example.com",
       "product": "iPad Air 5",
       "price": 1350.0,
-      "status": "pending",
+      "status": "shipped",
       "shipping_address": "ул. Търговска 5, Бургас",
-      "notes": "Подарък за рожден ден! Моля да се опакова."
+      "notes": "Подарък за рожден ден! Моля да се опакова.",
+      "email_events": [
+        {
+          "event": "sent",
+          "message_id": "msg_49fdd36f4ab34194b5dc9cd4e473feb6",
+          "to": "anna.k@example.com",
+          "type": "shipping_confirmation",
+          "ts": 1769077079
+        },
+        {
+          "event": "sent",
+          "message_id": "msg_3e3a94138d7b485b93a65aa73870a892",
+          "to": "anna.k@example.com",
+          "type": "shipping_confirmation",
+          "ts": 1769077135
+        }
+      ],
+      "email_status": "sent",
+      "email_message_id": "msg_3e3a94138d7b485b93a65aa73870a892"
     },
     "ORD-3007": {
       "customer_name": "Борис Михайлов",
