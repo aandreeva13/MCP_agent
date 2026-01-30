@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import sys
@@ -12,6 +13,9 @@ from typing import Any, AsyncIterator, Dict, Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
+
+logger = logging.getLogger("ui")
+logging.basicConfig(level=logging.INFO, format="[ui] %(message)s")
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -262,17 +266,21 @@ def _index_html() -> str:
         // Filter out internal log prefixes.
         if (stream !== 'stdout') return;
         if (!text) return;
+
+        const t = String(text);
+
+        // Ignore known internal/debug prefixes, but DO NOT ignore all lines that
+        // start with '[' because the UI prefixes stdout/stderr with [stdout]/[stderr].
         if (
-          text.startsWith('[host]') ||
-          text.startsWith('[crm_server]') ||
-          text.startsWith('[email_server]') ||
-          text.startsWith('[') // timestamps / other logs
+          t.startsWith('[host]') ||
+          t.startsWith('[crm_server]') ||
+          t.startsWith('[email_server]')
         ) {
           return;
         }
 
         // Show the last meaningful line as the assistant sentence.
-        assistantSaysEl.textContent = text;
+        assistantSaysEl.textContent = t;
       }
 
       function extractOrderIdFromCommand(cmd) {
@@ -306,6 +314,9 @@ def _index_html() -> str:
         const cmd = (cmdEl.value || '').trim();
         if (!cmd) return;
 
+        // Clear the input immediately so the user can type the next query.
+        cmdEl.value = '';
+
         resetPanels();
         statusEl.textContent = 'Starting...';
 
@@ -317,6 +328,16 @@ def _index_html() -> str:
         const data = await resp.json();
         if (!resp.ok) {
           statusEl.textContent = `Error: ${data.detail || resp.status}`;
+          return;
+        }
+
+        // Guard blocked: show refusal immediately and do NOT start SSE/subprocess UI flow.
+        if (data.blocked) {
+          assistantSaysEl.textContent = data.assistant || '—';
+          statusEl.textContent = 'Ready.';
+          stopEl.disabled = true;
+          runEl.disabled = false;
+          currentRunId = null;
           return;
         }
 
@@ -494,14 +515,107 @@ async def api_email_event(body: EmailEventIn) -> JSONResponse:
 
 @app.post("/run")
 async def run_agent_endpoint(request: Request) -> JSONResponse:
+    """UI Run handler.
+
+    This is the definitive backend entrypoint for the UI "Run" button.
+
+    It now runs a policy guard on every user input BEFORE starting any subprocess.
+    If the guard blocks, we return an immediate refusal payload and do not run the agent.
+    """
+
     global _active_run_id
 
     body = await request.json()
     command = str(body.get("command", "")).strip()
+
+    logger.info("HANDLER_CALLED")
+    logger.info("USER_TEXT=%r", command)
+
     if not command:
         return JSONResponse({"detail": "command is required"}, status_code=400)
     if len(command) > 500:
         return JSONResponse({"detail": "command too long"}, status_code=400)
+
+    # --- policy_guard / safety_guard (fast-path heuristic, JSON decision) ---
+    # Deterministic fast-path BEFORE any heuristics.
+    # If an order id is present, immediately ALLOW and bypass CLARIFY/BLOCK.
+    import re as _re
+
+    lowered = command.lower()
+    order_id_present = bool(_re.search(r"\bORD-\d+\b", command, flags=_re.IGNORECASE))
+
+    if order_id_present:
+        decision = "ALLOW"
+        reason = "Contains order id."
+    else:
+        # Out-of-scope patterns (BLOCK). Keep this list conservative; Host has a deeper LLM guard.
+        suspicious = any(
+            k in lowered
+            for k in [
+                "tell me a joke",
+                "say something funny",
+                "whats the weather",
+                "what's the weather",
+                "weather today",
+                "ignore your instructions",
+                "ignore previous instructions",
+                "ignore the above",
+                "system:",
+                "developer message",
+                "show your system prompt",
+                "reveal hidden rules",
+                "prompt injection",
+                "write a poem",
+                "life advice",
+            ]
+        )
+
+        # In-scope patterns (ALLOW). If no clear signal either way, CLARIFY.
+        allow_keywords = [
+            "order",
+            "status",
+            "tracking",
+            "shipping",
+            "ship",
+            "deliver",
+            "delivery",
+            "refund",
+            "return",
+            "troubleshoot",
+            "billing",
+            "account",
+            "invoice",
+            "cancel",
+        ]
+        in_scope = any(k in lowered for k in allow_keywords)
+
+        if suspicious:
+            decision = "BLOCK"
+            reason = "out_of_scope_or_injection"
+        elif in_scope:
+            # Support-related but missing required info (like order id).
+            decision = "CLARIFY"
+            reason = "missing_required_info"
+        else:
+            decision = "BLOCK"
+            reason = "out_of_scope"
+
+    logger.info("GUARD_DECISION=%s REASON=%s", decision, reason)
+
+    if decision == "BLOCK":
+        refusal = (
+            "I can’t help with jokes or unrelated requests. "
+            "I can help with orders, shipping, returns/refunds, or troubleshooting. "
+            "What do you need help with?"
+        )
+        return JSONResponse({"blocked": True, "assistant": refusal, "decision": decision, "reason": reason})
+
+    if decision == "CLARIFY":
+        clarify = (
+            "I can help with order status, shipping/delivery, returns/refunds, troubleshooting, or account/billing. "
+            "Please include your order id (e.g., ORD-1004) or a bit more detail."
+        )
+        return JSONResponse({"blocked": True, "assistant": clarify, "decision": decision, "reason": reason})
 
     # Single active run guard (keeps data.json writes sane).
     if _active_run_id is not None:
@@ -514,7 +628,7 @@ async def run_agent_endpoint(request: Request) -> JSONResponse:
     _runs[run_id] = Run(run_id=run_id, command=command, queue=q, task=task)
     _active_run_id = run_id
 
-    return JSONResponse({"run_id": run_id})
+    return JSONResponse({"run_id": run_id, "blocked": False})
 
 
 @app.post("/stop/{run_id}")

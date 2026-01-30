@@ -2,6 +2,19 @@
 
 A small local web UI for running the agent (the Host in [`main.py`](../main.py:1)) and streaming live output from stdout/stderr via Server-Sent Events (SSE).
 
+## Policy/Safety guard
+
+The UI backend runs a lightweight policy guard on **every** Run submission in [`POST /run`](app.py:495) before starting the agent subprocess.
+
+- If the guard returns `BLOCK` (e.g. “tell me a joke”), the endpoint returns an immediate refusal payload and the UI displays it in the Assistant panel.
+- If the guard returns `ALLOW`, the normal subprocess + SSE streaming flow runs unchanged.
+
+To sanity-check the guard without running the UI server:
+
+```bat
+python frontend\test_guard_run.py
+```
+
 ## Setup
 
 From the repo root:
